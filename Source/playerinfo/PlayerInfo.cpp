@@ -9,40 +9,8 @@
 #include <thread>
 
 namespace WPEFramework {
-class PlayerInfo : public Core::IReferenceCounted {
+class PlayerInfo {
 private:
-#ifdef __WINDOWS__
-#pragma warning(disable : 4355)
-#endif
-    PlayerInfo(const string& playerName, Exchange::IPlayerProperties* interface)
-        : _refCount(1)
-        , _name(playerName)
-        , _playerConnection(interface)
-        , _dolby(interface != nullptr ? interface->QueryInterface<Exchange::Dolby::IOutput>() : nullptr)
-        , _notification(this)
-        , _callbacks()
-    {
-        ASSERT(_playerConnection != nullptr);
-        _playerConnection->AddRef();
-    }
-#ifdef __WINDOWS__
-#pragma warning(default : 4355)
-#endif
-    ~PlayerInfo()
-    {
-        if (_playerConnection != nullptr) {
-            _playerConnection->Release();
-        }
-        if (_dolby != nullptr) {
-            _dolby->Release();
-        }
-    }
-
-    PluginHost::IShell*& GetSystemInterface()
-    {
-        return _administration.GetSystemInterface();
-    }
-
     typedef std::map<playerinfo_dolby_audio_updated_cb, void*> Callbacks;
 
     class Notification : public Exchange::Dolby::IOutput::INotification {
@@ -69,407 +37,48 @@ private:
         PlayerInfo& _parent;
     };
 
-    class PlayerInfoAdministration : protected std::list<PlayerInfo*> {
-    public:
-        PlayerInfoAdministration(const PlayerInfoAdministration&) = delete;
-        PlayerInfoAdministration& operator=(const PlayerInfoAdministration&) = delete;
-
-        PlayerInfoAdministration()
-            : _adminLock()
-            , _engine(Core::ProxyType<RPC::InvokeServerType<1, 0, 8>>::Create())
-            , _comChannel(Core::ProxyType<RPC::CommunicatorClient>::Create(Connector(), Core::ProxyType<Core::IIPCServer>(_engine)))
-        {
-            ASSERT(_engine != nullptr);
-            ASSERT(_comChannel != nullptr);
-            _engine->Announcements(_comChannel->Announcement());
-
-            _systemInterface = _comChannel->Open<PluginHost::IShell>(string());
-            _systemInterface->AddRef();
-            ASSERT(_systemInterface != nullptr);
-        }
-
-        ~PlayerInfoAdministration()
-        {
-            std::list<PlayerInfo*>::iterator index(std::list<PlayerInfo*>::begin());
-
-            while (index != std::list<PlayerInfo*>::end()) {
-                TRACE_L1(_T("Closing %s"), (*index)->Name().c_str());
-                ++index;
-            }
-
-            ASSERT(std::list<PlayerInfo*>::size() == 0);
-
-            if (_systemInterface != nullptr) {
-                _systemInterface->Release();
-            }
-            _comChannel->Close(1000);
-        }
-
-        PluginHost::IShell*& GetSystemInterface()
-        {
-            return _systemInterface;
-        }
-
-        PlayerInfo* Instance(const string& name)
-        {
-            PlayerInfo* result(nullptr);
-
-            _adminLock.Lock();
-
-            result = Find(name);
-            if (result == nullptr) {
-
-                Exchange::IPlayerProperties* interface = _systemInterface->QueryInterfaceByCallsign<Exchange::IPlayerProperties>(name);
-
-                if (interface != nullptr) {
-                    result = new PlayerInfo(name, interface);
-                    std::list<PlayerInfo*>::emplace_back(result);
-                    interface->Release();
-                }
-            }
-            _adminLock.Unlock();
-
-            return (result);
-        }
-
-        static Core::NodeId Connector()
-        {
-            const TCHAR* comPath = ::getenv(_T("COMMUNICATOR_PATH"));
-
-            if (comPath == nullptr) {
-#ifdef __WINDOWS__
-                comPath = _T("127.0.0.1:62000");
-#else
-                comPath = _T("/tmp/communicator");
-#endif
-            }
-
-            return Core::NodeId(comPath);
-        }
-
-        uint32_t Delete(const PlayerInfo* playerInfo, int& refCount)
-        {
-            uint32_t result(Core::ERROR_NONE);
-
-            _adminLock.Lock();
-
-            if (Core::InterlockedDecrement(refCount) == 0) {
-                std::list<PlayerInfo*>::iterator index(
-                    std::find(std::list<PlayerInfo*>::begin(), std::list<PlayerInfo*>::end(), playerInfo));
-
-                ASSERT(index != std::list<PlayerInfo*>::end());
-
-                if (index != std::list<PlayerInfo*>::end()) {
-                    std::list<PlayerInfo*>::erase(index);
-                }
-                delete const_cast<PlayerInfo*>(playerInfo);
-                result = Core::ERROR_DESTRUCTION_SUCCEEDED;
-            }
-
-            _adminLock.Unlock();
-
-            return result;
-        }
-
-    private:
-        PlayerInfo* Find(const string& name)
-        {
-            PlayerInfo* result(nullptr);
-
-            std::list<PlayerInfo*>::iterator index(std::list<PlayerInfo*>::begin());
-
-            while ((index != std::list<PlayerInfo*>::end()) && ((*index)->Name() != name)) {
-                index++;
-            }
-
-            if (index != std::list<PlayerInfo*>::end()) {
-                result = *index;
-                result->AddRef();
-            }
-
-            return result;
-        }
-
-        PluginHost::IShell* _systemInterface;
-
-        Core::CriticalSection _adminLock;
-        Core::ProxyType<RPC::InvokeServerType<1, 0, 8>> _engine;
-        Core::ProxyType<RPC::CommunicatorClient> _comChannel;
-    };
-
-    class Reconnector {
-        typedef std::map<playerinfo_state_changed_cb, void*> Callbacks;
-
-    public:
-        Reconnector(const Reconnector&) = delete;
-        Reconnector& operator=(const Reconnector&) = delete;
-
-        Reconnector(PluginHost::IShell*& systemInterface, playerinfo_type*& player, const std::string& callsign, bool toInstantiateOnActivation)
-            : _systemInterface(systemInterface != nullptr ? systemInterface : nullptr)
-            , _notification(this)
-            , _player(player)
-            , _callsign(callsign)
-            , _toInstantiateOnActivation(toInstantiateOnActivation)
-            , _timeToEnd(false)
-            , _event(false, true)
-
-        {
-            ASSERT(_systemInterface != nullptr);
-
-            _thread = std::thread(&Reconnector::CreatePlayerInfoInstance, this);
-
-            _notification.Initialize(_systemInterface);
-        }
-        ~Reconnector()
-        {
-            _notification.Deinitialize();
-
-            _timeToEnd = true;
-
-            _event.SetEvent();
-
-            if (_thread.joinable()) {
-                _thread.join();
-            }
-        }
-
-        void RegisterCallback(playerinfo_state_changed_cb callback, void* userdata)
-        {
-            if (callback != NULL) {
-                Callbacks::iterator index(_callbacks.find(callback));
-
-                if (index == _callbacks.end()) {
-                    _callbacks.emplace(std::piecewise_construct,
-                        std::forward_as_tuple(callback),
-                        std::forward_as_tuple(userdata));
-                }
-            }
-        }
-
-        void UnregisterCallback(playerinfo_state_changed_cb callback)
-        {
-            Callbacks::iterator index(_callbacks.find(callback));
-
-            if (index != _callbacks.end()) {
-                _callbacks.erase(index);
-            }
-        }
-
-        void ToInstantiateOnActivation(bool toInstantiate)
-        {
-            _toInstantiateOnActivation = toInstantiate;
-        }
-
-    private:
-        class Notification : protected PluginHost::IPlugin::INotification {
-        public:
-            Notification() = delete;
-            Notification(const Notification&) = delete;
-            Notification& operator=(const Notification&) = delete;
-            ~Notification() = default;
-
-            explicit Notification(Reconnector* parent)
-                : _parent(*parent)
-                , _client(nullptr)
-                , _isRegistered(false)
-            {
-                ASSERT(parent != nullptr);
-            }
-
-            void Initialize(PluginHost::IShell* client)
-            {
-                ASSERT(client != nullptr);
-                _client = client;
-                _client->AddRef();
-                _client->Register(this);
-                _isRegistered = true;
-            }
-            void Deinitialize()
-            {
-                ASSERT(_client != nullptr);
-                if (_client != nullptr) {
-                    _client->Unregister(this);
-                    _isRegistered = false;
-                    _client->Release();
-                    _client = nullptr;
-                }
-            }
-
-            void StateChange(PluginHost::IShell* plugin) override
-            {
-                ASSERT(plugin != nullptr);
-
-                if (_isRegistered) {
-                    _parent.StateChange(plugin);
-                }
-            }
-
-            BEGIN_INTERFACE_MAP(Notification)
-            INTERFACE_ENTRY(PluginHost::IPlugin::INotification)
-            END_INTERFACE_MAP
-
-        private:
-            Reconnector& _parent;
-            bool _isRegistered;
-            PluginHost::IShell* _client;
-        };
-
-    private:
-        void CreatePlayerInfoInstance()
-        {
-            while (true) {
-
-                _event.Lock();
-                _event.ResetEvent();
-
-                if (_timeToEnd) {
-                    return;
-                }
-                if (_toInstantiateOnActivation) {
-                    _player = reinterpret_cast<playerinfo_type*>(PlayerInfo::Instance("PlayerInfo"));
-                }
-            }
-        }
-
-        void StateChange(PluginHost::IShell* plugin)
-        {
-            _lock.Lock();
-
-            PluginHost::IShell::state state = plugin->State();
-            if (_callsign == plugin->Callsign()) {
-                switch (state) {
-                //Creating instance
-                case PluginHost::IShell::ACTIVATED:
-                    ASSERT(_player == NULL);
-
-                    if (_toInstantiateOnActivation) {
-                        _event.SetEvent();
-                    }
-                    for (const auto& i : _callbacks) {
-                        i.first(i.second, ACTIVATED);
-                    }
-                    break;
-
-                //Destroying instance
-                case PluginHost::IShell::DEACTIVATION:
-                    ASSERT(_player != NULL);
-
-                    reinterpret_cast<PlayerInfo*>(_player)->Release();
-                    _player = NULL;
-
-                    for (const auto& i : _callbacks) {
-                        i.first(i.second, DEACTIVATION);
-                    }
-                    break;
-
-                case PluginHost::IShell::DEACTIVATED:
-                    for (const auto& i : _callbacks) {
-                        i.first(i.second, DEACTIVATED);
-                    }
-                    break;
-
-                case PluginHost::IShell::ACTIVATION:
-                    for (const auto& i : _callbacks) {
-                        i.first(i.second, ACTIVATION);
-                    }
-                    break;
-
-                case PluginHost::IShell::PRECONDITION:
-                    for (const auto& i : _callbacks) {
-                        i.first(i.second, PRECONDITION);
-                    }
-                    break;
-
-                case PluginHost::IShell::DESTROYED:
-                    for (const auto& i : _callbacks) {
-                        i.first(i.second, PRECONDITION);
-                    }
-                    break;
-
-                default:
-                    break;
-                }
-            }
-
-            _lock.Unlock();
-        }
-
-    private:
-        PluginHost::IShell* _systemInterface;
-        Core::Sink<Notification> _notification;
-        mutable Core::CriticalSection _adminLock;
-
-        bool _toInstantiateOnActivation;
-        Callbacks _callbacks;
-        playerinfo_type*& _player;
-        std::string _callsign;
-
-        bool _timeToEnd;
-        std::thread _thread;
-        Core::CriticalSection _lock;
-        Core::Event _event;
-    };
-
-    mutable int _refCount;
     const string _name;
     Exchange::IPlayerProperties* _playerConnection;
     Exchange::Dolby::IOutput* _dolby;
     Core::Sink<Notification> _notification;
     Callbacks _callbacks;
-    static PlayerInfo::PlayerInfoAdministration _administration;
-    static PlayerInfo::Reconnector* _notifier;
 
 public:
     PlayerInfo() = delete;
     PlayerInfo(const PlayerInfo&) = delete;
     PlayerInfo& operator=(const PlayerInfo&) = delete;
 
-    static PlayerInfo* Instance(const string& name)
+#ifdef __WINDOWS__
+#pragma warning(disable : 4355)
+#endif
+    PlayerInfo(const string& playerName, Exchange::IPlayerProperties* interface)
+        : _name(playerName)
+        , _playerConnection(interface)
+        , _dolby(interface != nullptr ? interface->QueryInterface<Exchange::Dolby::IOutput>() : nullptr)
+        , _notification(this)
+        , _callbacks()
     {
-        return _administration.Instance(name);
+        ASSERT(_playerConnection != nullptr);
+        _playerConnection->AddRef();
     }
+#ifdef __WINDOWS__
+#pragma warning(default : 4355)
+#endif
 
-    static void EnableAutomaticReconnection(playerinfo_type*& type, bool toInstantiateOnActivation)
+    ~PlayerInfo()
     {
-        _notifier = new Reconnector(reinterpret_cast<PlayerInfo*>(type)->GetSystemInterface(),
-            type, reinterpret_cast<PlayerInfo*>(type)->Name(), toInstantiateOnActivation);
-    }
-    static void DisableAutomaticReconnection()
-    {
-        if (_notifier != nullptr) {
-            delete _notifier;
-            _notifier = nullptr;
+        if (_playerConnection != nullptr) {
+            _playerConnection->Release();
         }
-    }
-    static void RegisterPluginStateChangeCallback(playerinfo_state_changed_cb callback, void* userdata)
-    {
-        if (_notifier != nullptr) {
-            _notifier->RegisterCallback(callback, userdata);
-        }
-    }
-    static void UnregisterPluginStateChangeCallback(playerinfo_state_changed_cb callback)
-    {
-        if (_notifier != nullptr) {
-            _notifier->UnregisterCallback(callback);
-        }
-    }
-    static void ToInstantiateOnActivation(bool toInstantiate)
-    {
-        if (_notifier != nullptr) {
-            _notifier->ToInstantiateOnActivation(toInstantiate);
+        if (_dolby != nullptr) {
+            _dolby->Release();
         }
     }
 
-    void AddRef() const
+    const string& Name() const
     {
-        Core::InterlockedIncrement(_refCount);
+        return _name;
     }
-    uint32_t Release() const
-    {
-        return _administration.Delete(this, _refCount);
-    }
-
-    const string& Name() const { return _name; }
 
     void Updated(const Exchange::Dolby::IOutput::SoundModes mode, const bool enabled)
     {
@@ -691,44 +300,243 @@ public:
     }
 };
 
-/* static */ PlayerInfo::PlayerInfoAdministration PlayerInfo::_administration;
-PlayerInfo::Reconnector* PlayerInfo::_notifier;
+//PROXY
+
+class ReconnectionProxy {
+private:
+    ReconnectionProxy()
+        : _engine(Core::ProxyType<RPC::InvokeServerType<1, 0, 8>>::Create())
+        , _comChannel(Core::ProxyType<RPC::CommunicatorClient>::Create(Connector(), Core::ProxyType<Core::IIPCServer>(_engine)))
+        , _notification(this)
+        , _systemInterface(nullptr)
+        , _playerInfo(nullptr)
+        , _callsign("PlayerInfo")
+        , _timeToEnd(false)
+        , _event(false, true)
+    {
+        _adminLock.Lock();
+
+        ASSERT(_engine != nullptr);
+        ASSERT(_comChannel != nullptr);
+        _engine->Announcements(_comChannel->Announcement());
+
+        _systemInterface = _comChannel->Open<PluginHost::IShell>(string());
+        _systemInterface->AddRef();
+
+        ASSERT(_systemInterface != nullptr);
+        if (_systemInterface != nullptr) {
+            _thread = std::thread(&ReconnectionProxy::Reinstantiate, this);
+            _notification.Initialize(_systemInterface);
+
+            bool isCreated = CreateInstance();
+            ASSERT(isCreated == true);
+        }
+        _adminLock.Unlock();
+    }
+
+    ~ReconnectionProxy()
+    {
+        _notification.Deinitialize();
+        if (_systemInterface != nullptr) {
+            _systemInterface->Release();
+        }
+
+        _timeToEnd = true;
+
+        _event.SetEvent();
+        if (_thread.joinable()) {
+            _thread.join();
+        }
+
+        delete _playerInfo;
+        if (_comChannel.IsValid()) {
+            _comChannel->Close(1000);
+        }
+    }
+
+    ReconnectionProxy(const ReconnectionProxy&) = delete;
+    ReconnectionProxy& operator=(const ReconnectionProxy&) = delete;
+
+    static Core::NodeId Connector()
+    {
+        const TCHAR* comPath = ::getenv(_T("COMMUNICATOR_PATH"));
+
+        if (comPath == nullptr) {
+#ifdef __WINDOWS__
+            comPath = _T("127.0.0.1:62000");
+#else
+            comPath = _T("/tmp/communicator");
+#endif
+        }
+
+        return Core::NodeId(comPath);
+    }
+
+    static ReconnectionProxy* _instance;
+
+private:
+    void StateChange(PluginHost::IShell* plugin)
+    {
+        _lock.Lock();
+
+        PluginHost::IShell::state state = plugin->State();
+        if (_callsign == plugin->Callsign()) {
+            if (state == PluginHost::IShell::ACTIVATED) {
+                _event.SetEvent();
+                fprintf(stderr, "ACTIVATING\n");
+
+            } else if (state == PluginHost::IShell::DEACTIVATION) {
+                fprintf(stderr, "DEACTIVATING\n");
+                delete _playerInfo;
+                _playerInfo = nullptr;
+            }
+        }
+
+        _lock.Unlock();
+    }
+    bool CreateInstance()
+    {
+        ASSERT(_systemInterface != nullptr);
+        ASSERT(_playerInfo == nullptr);
+        bool isCreated = false;
+
+        if (_playerInfo == nullptr) {
+            Exchange::IPlayerProperties* playerInfoInterface = _systemInterface->QueryInterfaceByCallsign<Exchange::IPlayerProperties>(_callsign);
+
+            ASSERT(playerInfoInterface != nullptr);
+            if (playerInfoInterface != nullptr) {
+                _playerInfo = new PlayerInfo(_callsign, playerInfoInterface);
+                playerInfoInterface->Release();
+
+                if (_playerInfo != nullptr) {
+                    isCreated = true;
+                }
+            }
+        }
+        return isCreated;
+    }
+
+    void Reinstantiate()
+    {
+        while (true) {
+
+            _event.Lock();
+            _event.ResetEvent();
+
+            if (_timeToEnd) {
+                return;
+            }
+            CreateInstance();
+        }
+    }
+
+private:
+    class Notification : protected PluginHost::IPlugin::INotification {
+    public:
+        Notification() = delete;
+        Notification(const Notification&) = delete;
+        Notification& operator=(const Notification&) = delete;
+        ~Notification() = default;
+
+        explicit Notification(ReconnectionProxy* parent)
+            : _parent(*parent)
+            , _client(nullptr)
+            , _isRegistered(false)
+        {
+            ASSERT(parent != nullptr);
+        }
+
+        void Initialize(PluginHost::IShell* client)
+        {
+            ASSERT(client != nullptr);
+            _client = client;
+            _client->AddRef();
+            _client->Register(this);
+            _isRegistered = true;
+        }
+        void Deinitialize()
+        {
+            ASSERT(_client != nullptr);
+            if (_client != nullptr) {
+                _client->Unregister(this);
+                _isRegistered = false;
+                _client->Release();
+                _client = nullptr;
+            }
+        }
+
+        void StateChange(PluginHost::IShell* plugin) override
+        {
+            ASSERT(plugin != nullptr);
+
+            if (_isRegistered) {
+                _parent.StateChange(plugin);
+            }
+        }
+
+        BEGIN_INTERFACE_MAP(Notification)
+        INTERFACE_ENTRY(PluginHost::IPlugin::INotification)
+        END_INTERFACE_MAP
+
+    private:
+        ReconnectionProxy& _parent;
+        bool _isRegistered;
+        PluginHost::IShell* _client;
+    };
+
+public:
+    //TODO what if construction fails
+    static ReconnectionProxy* Instance()
+    {
+        if (_instance == nullptr) {
+            _instance = new ReconnectionProxy();
+        }
+        return _instance;
+    }
+    void Delete()
+    {
+        delete _instance;
+    }
+
+public:
+    uint32_t IsAudioEquivalenceEnabled(bool& outIsEnabled) const
+    {
+        if (_playerInfo != nullptr) {
+            fprintf(stderr, "NOT NULL\n");
+
+            return _playerInfo->IsAudioEquivalenceEnabled(outIsEnabled);
+        }
+        return Core::ERROR_UNAVAILABLE;
+    }
+
+private:
+    Core::Sink<Notification> _notification;
+
+    Core::ProxyType<RPC::InvokeServerType<1, 0, 8>> _engine;
+    Core::ProxyType<RPC::CommunicatorClient> _comChannel;
+
+    PluginHost::IShell* _systemInterface;
+    PlayerInfo* _playerInfo;
+    std::string _callsign;
+
+    mutable Core::CriticalSection _adminLock;
+    bool _timeToEnd;
+    std::thread _thread;
+    Core::CriticalSection _lock;
+    Core::Event _event;
+};
+ReconnectionProxy* ReconnectionProxy::_instance;
+
+//!PROXY
 } //namespace WPEFramework
 
 using namespace WPEFramework;
 extern "C" {
 
-void playerinfo_enable_automatic_reconnection(struct playerinfo_type** type, bool to_instantiate)
-{
-    if (*type != NULL) {
-        PlayerInfo::EnableAutomaticReconnection(*type, to_instantiate);
-    }
-}
-
-void playerinfo_register_state_change_callback(playerinfo_state_changed_cb callback, void* userdata)
-{
-    PlayerInfo::RegisterPluginStateChangeCallback(callback, userdata);
-}
-
-void playerinfo_unregister_state_change_callback(playerinfo_state_changed_cb callback)
-{
-    PlayerInfo::UnregisterPluginStateChangeCallback(callback);
-}
-
-void playerinfo_disable_automatic_reconnection()
-{
-    PlayerInfo::DisableAutomaticReconnection();
-}
-
-void playerinfo_to_instantiate_on_reconnection(bool to_instantiate)
-{
-    PlayerInfo::ToInstantiateOnActivation(to_instantiate);
-}
-
 struct playerinfo_type* playerinfo_instance(const char name[])
 {
     if (name != NULL) {
-        return reinterpret_cast<playerinfo_type*>(PlayerInfo::Instance(string(name)));
+        return reinterpret_cast<playerinfo_type*>(ReconnectionProxy::Instance());
     }
     return NULL;
 }
@@ -750,7 +558,7 @@ void playerinfo_unregister(struct playerinfo_type* instance, playerinfo_dolby_au
 void playerinfo_release(struct playerinfo_type* instance)
 {
     if (instance != NULL) {
-        reinterpret_cast<PlayerInfo*>(instance)->Release();
+        reinterpret_cast<ReconnectionProxy*>(instance)->Delete();
     }
 }
 
@@ -806,7 +614,7 @@ uint32_t playerinfo_playback_resolution(struct playerinfo_type* instance, player
 uint32_t playerinfo_is_audio_equivalence_enabled(struct playerinfo_type* instance, bool* is_enabled)
 {
     if (instance != NULL && is_enabled != NULL) {
-        return reinterpret_cast<PlayerInfo*>(instance)->IsAudioEquivalenceEnabled(*is_enabled);
+        return reinterpret_cast<ReconnectionProxy*>(instance)->IsAudioEquivalenceEnabled(*is_enabled);
     }
     return Core::ERROR_UNAVAILABLE;
 }

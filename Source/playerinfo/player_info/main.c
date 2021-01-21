@@ -43,16 +43,6 @@ void OnEvent(struct playerinfo_type* session, void* data)
     Trace("Event triggered");
 }
 
-void StateChangedCallback(void* userdata, playerinfo_plugin_state_t state)
-{
-    if (state == ACTIVATED) {
-        Trace("PlayerInfo plugin has been just activated!");
-    }
-    if (state == DEACTIVATED) {
-        Trace("PlayerInfo plugin has been just deactivated!");
-    }
-}
-
 
 int main(int argc, char* argv[])
 {
@@ -75,9 +65,6 @@ int main(int argc, char* argv[])
                 character = 'Q';
             } else {
                 Trace("Created instance");
-                playerinfo_enable_automatic_reconnection(&player, true);
-                playerinfo_register_state_change_callback(StateChangedCallback, NULL);
-                Trace("Registered for reconnection and passed callback");
             }
 
             break;
@@ -369,9 +356,7 @@ int main(int argc, char* argv[])
         }
     } while (character != 'Q');
 
-    playerinfo_unregister_state_change_callback(StateChangedCallback);
     playerinfo_release(player);
-    playerinfo_disable_automatic_reconnection();
 
     Trace("Done");
 
