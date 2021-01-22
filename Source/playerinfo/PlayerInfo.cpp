@@ -314,31 +314,28 @@ private:
         , _timeToEnd(false)
         , _event(false, true)
     {
-        _adminLock.Lock();
 
         ASSERT(_engine != nullptr);
         ASSERT(_comChannel != nullptr);
         _engine->Announcements(_comChannel->Announcement());
 
         _systemInterface = _comChannel->Open<PluginHost::IShell>(string());
-        _systemInterface->AddRef();
 
         ASSERT(_systemInterface != nullptr);
         if (_systemInterface != nullptr) {
+            _systemInterface->AddRef();
             _thread = std::thread(&ReconnectionProxy::Reinstantiate, this);
+
             _notification.Initialize(_systemInterface);
 
             CreateInstance();
-            ASSERT(_playerInfo != nullptr);
         }
-        _adminLock.Unlock();
     }
 
     ~ReconnectionProxy()
     {
-        if (_systemInterface != nullptr) {
-            _systemInterface->Release();
-        }
+        fprintf(stderr, "destructor\n");
+        _notification.Deinitialize(); //takes care of release of _systemInterface
 
         _timeToEnd = true;
 
@@ -349,9 +346,11 @@ private:
 
         delete _playerInfo;
         if (_comChannel.IsValid()) {
-            _comChannel->Close(1000);
+            if (_comChannel->IsOpen()) {
+                _comChannel->Close(1000);
+            }
+            _comChannel.Release();
         }
-        _notification.Deinitialize();
     }
 
     ReconnectionProxy(const ReconnectionProxy&) = delete;
@@ -377,9 +376,10 @@ private:
 private:
     void StateChange(PluginHost::IShell* plugin)
     {
-        _lock.Lock();
+        _adminLock.Lock();
 
-        PluginHost::IShell::state state = plugin->State();
+        PluginHost::IShell::state state
+            = plugin->State();
         if (_callsign == plugin->Callsign()) {
             if (state == PluginHost::IShell::ACTIVATED) {
                 _event.SetEvent();
@@ -392,7 +392,7 @@ private:
             }
         }
 
-        _lock.Unlock();
+        _adminLock.Unlock();
     }
     void CreateInstance()
     {
@@ -400,13 +400,16 @@ private:
         ASSERT(_playerInfo == nullptr);
 
         if (_playerInfo == nullptr) {
+            _adminLock.Lock();
             Exchange::IPlayerProperties* playerInfoInterface = _systemInterface->QueryInterfaceByCallsign<Exchange::IPlayerProperties>(_callsign);
 
-            ASSERT(playerInfoInterface != nullptr);
             if (playerInfoInterface != nullptr) {
+                fprintf(stderr, "Creating\n");
                 _playerInfo = new PlayerInfo(_callsign, playerInfoInterface);
                 playerInfoInterface->Release();
             }
+
+            _adminLock.Unlock();
         }
     }
 
@@ -452,6 +455,7 @@ private:
         {
             ASSERT(_client != nullptr);
             if (_client != nullptr) {
+                fprintf(stderr, "not nullptr\n");
                 _client->Unregister(this);
                 _isRegistered = false;
                 _client->Release();
@@ -479,7 +483,6 @@ private:
     };
 
 public:
-    //TODO what if construction fails
     static ReconnectionProxy* Instance()
     {
         if (_instance == nullptr) {
@@ -527,7 +530,6 @@ private:
     mutable Core::CriticalSection _adminLock;
     bool _timeToEnd;
     std::thread _thread;
-    Core::CriticalSection _lock;
     Core::Event _event;
 };
 ReconnectionProxy* ReconnectionProxy::_instance;
