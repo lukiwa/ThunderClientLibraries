@@ -328,15 +328,14 @@ private:
             _thread = std::thread(&ReconnectionProxy::Reinstantiate, this);
             _notification.Initialize(_systemInterface);
 
-            bool isCreated = CreateInstance();
-            ASSERT(isCreated == true);
+            CreateInstance();
+            ASSERT(_playerInfo != nullptr);
         }
         _adminLock.Unlock();
     }
 
     ~ReconnectionProxy()
     {
-        _notification.Deinitialize();
         if (_systemInterface != nullptr) {
             _systemInterface->Release();
         }
@@ -352,6 +351,7 @@ private:
         if (_comChannel.IsValid()) {
             _comChannel->Close(1000);
         }
+        _notification.Deinitialize();
     }
 
     ReconnectionProxy(const ReconnectionProxy&) = delete;
@@ -394,11 +394,10 @@ private:
 
         _lock.Unlock();
     }
-    bool CreateInstance()
+    void CreateInstance()
     {
         ASSERT(_systemInterface != nullptr);
         ASSERT(_playerInfo == nullptr);
-        bool isCreated = false;
 
         if (_playerInfo == nullptr) {
             Exchange::IPlayerProperties* playerInfoInterface = _systemInterface->QueryInterfaceByCallsign<Exchange::IPlayerProperties>(_callsign);
@@ -407,13 +406,8 @@ private:
             if (playerInfoInterface != nullptr) {
                 _playerInfo = new PlayerInfo(_callsign, playerInfoInterface);
                 playerInfoInterface->Release();
-
-                if (_playerInfo != nullptr) {
-                    isCreated = true;
-                }
             }
         }
-        return isCreated;
     }
 
     void Reinstantiate()
@@ -490,9 +484,20 @@ public:
     {
         if (_instance == nullptr) {
             _instance = new ReconnectionProxy();
+            if (!_instance->IsProperlyConstructed()) {
+                delete _instance;
+                _instance = nullptr;
+            }
         }
         return _instance;
     }
+    bool IsProperlyConstructed() const
+    {
+        if (_comChannel.IsValid()) {
+            return (_comChannel->IsOpen() && _systemInterface != nullptr && _playerInfo != nullptr);
+        }
+    }
+
     void Delete()
     {
         delete _instance;
