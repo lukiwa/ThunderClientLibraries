@@ -52,6 +52,7 @@ public:
 #pragma warning(disable : 4355)
 #endif
     PlayerInfo(const string& playerName, Exchange::IPlayerProperties* interface)
+
         : _name(playerName)
         , _playerConnection(interface)
         , _dolby(interface != nullptr ? interface->QueryInterface<Exchange::Dolby::IOutput>() : nullptr)
@@ -301,29 +302,90 @@ public:
 };
 
 //PROXY
+template <typename INTERFACE>
+class ConnectorType {
+private:
+    class Channel : public RPC::CommunicatorClient {
+    public:
+        Channel() = delete;
+        Channel(const Channel&) = delete;
+        Channel& operator=(const Channel&) = delete;
 
+        Channel(const Core::NodeId& remoteNode, const Core::ProxyType<Core::IIPCServer>& handler)
+            : RPC::CommunicatorClient(remoteNode, handler)
+        {
+        }
+        ~Channel() override = default;
+
+    public:
+        uint32_t Initialize()
+        {
+            return (RPC::CommunicatorClient::Open(Core::infinite));
+        }
+        void Deintialize()
+        {
+            RPC::CommunicatorClient::Close(Core::infinite);
+        }
+
+        INTERFACE* Aquire(const string className, const uint32_t version)
+        {
+            return RPC::CommunicatorClient::Aquire<INTERFACE>(Core::infinite, className, version);
+        }
+    };
+
+public:
+    ConnectorType(const ConnectorType<INTERFACE>&) = delete;
+    ConnectorType<INTERFACE>& operator=(const ConnectorType<INTERFACE>&) = delete;
+
+    ConnectorType()
+    {
+    }
+    ~ConnectorType() = default;
+
+    INTERFACE* Instance(const Core::NodeId& nodeId, const string className, const uint32_t version = ~0)
+    {
+        INTERFACE* result = nullptr;
+        if (_engine.IsValid() == false) {
+            _engine = Core::ProxyType<RPC::InvokeServerType<1, 0, 8>>::Create();
+            ASSERT(_engine != nullptr);
+        }
+
+        Core::ProxyType<Channel> channel = _comChannels.Instance(nodeId, Core::ProxyType<WPEFramework::Core::IIPCServer>(_engine));
+
+        if (channel.IsValid() == true) {
+            result = channel->Aquire(className, version);
+        }
+
+        return (result);
+    }
+
+private:
+    Core::ProxyType<RPC::InvokeServerType<1, 0, 8>> _engine;
+    Core::ProxyMapType<Core::NodeId, Channel> _comChannels;
+};
+
+template <typename INTERFACE, typename CREATOR_CLASS>
 class ReconnectionProxy {
 private:
-    ReconnectionProxy()
-        : _engine(Core::ProxyType<RPC::InvokeServerType<1, 0, 8>>::Create())
-        , _comChannel(Core::ProxyType<RPC::CommunicatorClient>::Create(Connector(), Core::ProxyType<Core::IIPCServer>(_engine)))
+    ReconnectionProxy(const std::string& callsign)
+        : _systemInterface(nullptr)
         , _notification(this)
-        , _systemInterface(nullptr)
-        , _playerInfo(nullptr)
-        , _callsign("PlayerInfo")
+        , _connectionClass(nullptr)
+        , _callsign(callsign)
         , _timeToEnd(false)
         , _event(false, true)
     {
 
         ASSERT(_engine != nullptr);
         ASSERT(_comChannel != nullptr);
-        _engine->Announcements(_comChannel->Announcement());
 
-        _systemInterface = _comChannel->Open<PluginHost::IShell>(string());
+        ConnectorType<PluginHost::IShell> systemInterface;
+        _systemInterface = systemInterface.Instance(Connector(), string());
 
         ASSERT(_systemInterface != nullptr);
         if (_systemInterface != nullptr) {
             _systemInterface->AddRef();
+
             _thread = std::thread(&ReconnectionProxy::Reinstantiate, this);
 
             _notification.Initialize(_systemInterface);
@@ -344,13 +406,7 @@ private:
             _thread.join();
         }
 
-        delete _playerInfo;
-        if (_comChannel.IsValid()) {
-            if (_comChannel->IsOpen()) {
-                _comChannel->Close(1000);
-            }
-            _comChannel.Release();
-        }
+        delete _connectionClass;
     }
 
     ReconnectionProxy(const ReconnectionProxy&) = delete;
@@ -378,8 +434,7 @@ private:
     {
         _adminLock.Lock();
 
-        PluginHost::IShell::state state
-            = plugin->State();
+        PluginHost::IShell::state state = plugin->State();
         if (_callsign == plugin->Callsign()) {
             if (state == PluginHost::IShell::ACTIVATED) {
                 _event.SetEvent();
@@ -387,8 +442,8 @@ private:
 
             } else if (state == PluginHost::IShell::DEACTIVATION) {
                 fprintf(stderr, "DEACTIVATING\n");
-                delete _playerInfo;
-                _playerInfo = nullptr;
+                delete _connectionClass;
+                _connectionClass = nullptr;
             }
         }
 
@@ -397,16 +452,18 @@ private:
     void CreateInstance()
     {
         ASSERT(_systemInterface != nullptr);
-        ASSERT(_playerInfo == nullptr);
+        ASSERT(_connectionClass == nullptr);
 
-        if (_playerInfo == nullptr) {
+        if (_connectionClass == nullptr) {
             _adminLock.Lock();
-            Exchange::IPlayerProperties* playerInfoInterface = _systemInterface->QueryInterfaceByCallsign<Exchange::IPlayerProperties>(_callsign);
 
-            if (playerInfoInterface != nullptr) {
+            ConnectorType<INTERFACE> connectorToInterface;
+            INTERFACE* interface = connectorToInterface.Instance(Connector(), _callsign);
+
+            if (interface != nullptr) {
                 fprintf(stderr, "Creating\n");
-                _playerInfo = new PlayerInfo(_callsign, playerInfoInterface);
-                playerInfoInterface->Release();
+                _connectionClass = new CREATOR_CLASS(_callsign, interface);
+                interface->Release();
             }
 
             _adminLock.Unlock();
@@ -486,7 +543,7 @@ public:
     static ReconnectionProxy* Instance()
     {
         if (_instance == nullptr) {
-            _instance = new ReconnectionProxy();
+            _instance = new ReconnectionProxy("PlayerInfo"); //change interesting callsign
             if (!_instance->IsProperlyConstructed()) {
                 delete _instance;
                 _instance = nullptr;
@@ -496,35 +553,33 @@ public:
     }
     bool IsProperlyConstructed() const
     {
-        if (_comChannel.IsValid()) {
-            return (_comChannel->IsOpen() && _systemInterface != nullptr && _playerInfo != nullptr);
-        }
+        return _systemInterface != nullptr && _connectionClass != nullptr;
     }
-
     void Delete()
     {
         delete _instance;
     }
 
 public:
+    /*
+    PROXIES TO USER CLASS GOES HERE (example below)
     uint32_t IsAudioEquivalenceEnabled(bool& outIsEnabled) const
     {
-        if (_playerInfo != nullptr) {
+        if (_connectionClass != nullptr) {
             fprintf(stderr, "NOT NULL\n");
 
-            return _playerInfo->IsAudioEquivalenceEnabled(outIsEnabled);
+            //for this example _connectionClass is PlayerInfo from the begining of this file
+            return _connectionClass->IsAudioEquivalenceEnabled(outIsEnabled);
         }
         return Core::ERROR_UNAVAILABLE;
     }
+    */
 
 private:
     Core::Sink<Notification> _notification;
 
-    Core::ProxyType<RPC::InvokeServerType<1, 0, 8>> _engine;
-    Core::ProxyType<RPC::CommunicatorClient> _comChannel;
-
     PluginHost::IShell* _systemInterface;
-    PlayerInfo* _playerInfo;
+    CREATOR_CLASS* _connectionClass;
     std::string _callsign;
 
     mutable Core::CriticalSection _adminLock;
@@ -532,7 +587,11 @@ private:
     std::thread _thread;
     Core::Event _event;
 };
-ReconnectionProxy* ReconnectionProxy::_instance;
+
+template <typename INTERFACE, typename CREATOR_CLASS>
+ReconnectionProxy<INTERFACE, CREATOR_CLASS>* ReconnectionProxy<INTERFACE, CREATOR_CLASS>::_instance;
+
+using PlayerInfoReconnectionProxy = ReconnectionProxy<Exchange::IPlayerProperties, PlayerInfo>;
 
 //!PROXY
 } //namespace WPEFramework
@@ -543,7 +602,7 @@ extern "C" {
 struct playerinfo_type* playerinfo_instance(const char name[])
 {
     if (name != NULL) {
-        return reinterpret_cast<playerinfo_type*>(ReconnectionProxy::Instance());
+        return reinterpret_cast<playerinfo_type*>(PlayerInfoReconnectionProxy::Instance());
     }
     return NULL;
 }
@@ -565,7 +624,7 @@ void playerinfo_unregister(struct playerinfo_type* instance, playerinfo_dolby_au
 void playerinfo_release(struct playerinfo_type* instance)
 {
     if (instance != NULL) {
-        reinterpret_cast<ReconnectionProxy*>(instance)->Delete();
+        reinterpret_cast<PlayerInfoReconnectionProxy*>(instance)->Delete();
     }
 }
 
@@ -621,7 +680,7 @@ uint32_t playerinfo_playback_resolution(struct playerinfo_type* instance, player
 uint32_t playerinfo_is_audio_equivalence_enabled(struct playerinfo_type* instance, bool* is_enabled)
 {
     if (instance != NULL && is_enabled != NULL) {
-        return reinterpret_cast<ReconnectionProxy*>(instance)->IsAudioEquivalenceEnabled(*is_enabled);
+        //    return reinterpret_cast<ReconnectionProxy*>(instance)->IsAudioEquivalenceEnabled(*is_enabled);
     }
     return Core::ERROR_UNAVAILABLE;
 }
