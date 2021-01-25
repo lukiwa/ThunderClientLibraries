@@ -409,8 +409,8 @@ private:
         delete _connectionClass;
     }
 
-    ReconnectionProxy(const ReconnectionProxy&) = delete;
-    ReconnectionProxy& operator=(const ReconnectionProxy&) = delete;
+    ReconnectionProxy(const ReconnectionProxy<INTERFACE, CREATOR_CLASS>&) = delete;
+    ReconnectionProxy& operator=(const ReconnectionProxy<INTERFACE, CREATOR_CLASS>&) = delete;
 
     static Core::NodeId Connector()
     {
@@ -427,7 +427,7 @@ private:
         return Core::NodeId(comPath);
     }
 
-    static ReconnectionProxy* _instance;
+    static ReconnectionProxy<INTERFACE, CREATOR_CLASS>* _instance;
 
 private:
     void StateChange(PluginHost::IShell* plugin)
@@ -583,7 +583,7 @@ private:
     std::string _callsign;
 
     mutable Core::CriticalSection _adminLock;
-    bool _timeToEnd;
+    bool _timeToEnd; //used to wake spinning std::thread, waiting for state change
     std::thread _thread;
     Core::Event _event;
 };
